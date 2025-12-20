@@ -149,6 +149,13 @@ export const ChatInterface: React.FC = () => {
 
     return (
         <div className="app-layout">
+            {/* Reopen sidebar button (visible when closed) */}
+            {!sidebarOpen && (
+                <button onClick={() => setSidebarOpen(true)} className="sidebar-reopen-btn">
+                    ☰
+                </button>
+            )}
+
             {/* Sidebar */}
             <aside className={`sidebar ${sidebarOpen ? 'open' : 'closed'}`}>
                 <div className="sidebar-header">
