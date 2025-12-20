@@ -11,9 +11,13 @@ import subprocess
 import os
 import tempfile
 import re
+import urllib.request
+import urllib.error
 
 # Configuration
 PORT = 8080
+OLLAMA_API_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "phi"  # Faster model (~10s vs ~30s)
 C_EXECUTABLE = "./search_engine"  # Path to compiled C program
 
 class SearchEngineState:
@@ -62,6 +66,33 @@ class SearchEngineState:
 # Global state
 engine_state = SearchEngineState()
 
+def load_documents_from_folder():
+    """Load all .txt files from documents folder on startup"""
+    docs_dir = "documents"
+    if not os.path.exists(docs_dir):
+        print(f"⚠️  Documents folder not found at '{docs_dir}'")
+        return
+    
+    txt_files = [f for f in os.listdir(docs_dir) if f.endswith('.txt')]
+    
+    if not txt_files:
+        print(f"⚠️  No .txt files found in '{docs_dir}'")
+        return
+    
+    print(f"\n📚 Loading documents from '{docs_dir}' folder...")
+    
+    for filename in txt_files:
+        filepath = os.path.join(docs_dir, filename)
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+                doc_id = engine_state.add_document(filename, content)
+                print(f"  ✓ Indexed: {filename} (ID: {doc_id})")
+        except Exception as e:
+            print(f"  ✗ Error loading {filename}: {e}")
+    
+    print(f"\n✅ Loaded {len(engine_state.documents)} documents\n")
+
 class BridgeHandler(BaseHTTPRequestHandler):
     """HTTP request handler that bridges HTML frontend to C backend"""
     
@@ -92,6 +123,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         elif self.path.startswith('/api/search?'):
             # Perform search
             self._perform_search()
+        elif self.path.startswith('/api/autocomplete?'):
+            # Autocomplete suggestions
+            self._handle_autocomplete()
         else:
             self._set_headers(404)
             self.wfile.write(b'{"error": "Not found"}')
@@ -101,6 +135,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if self.path == '/api/index':
             # Index a document
             self._index_document()
+        elif self.path == '/api/rag':
+            # Query Ollama directly
+            self._handle_rag_request()
+        elif self.path == '/api/upload':
+            # Handle file upload for summarization
+            self._handle_upload()
         else:
             self._set_headers(404)
             self.wfile.write(b'{"error": "Not found"}')
@@ -195,6 +235,43 @@ class BridgeHandler(BaseHTTPRequestHandler):
             
             self._set_headers()
             self.wfile.write(json.dumps(results).encode())
+            
+        except Exception as e:
+            self._set_headers(500)
+            self.wfile.write(json.dumps({'error': str(e)}).encode())
+    
+    def _handle_autocomplete(self):
+        """Handle autocomplete requests using prefix search"""
+        try:
+            query_string = self.path.split('?')[1]
+            params = {}
+            for param in query_string.split('&'):
+                if '=' in param:
+                    key, value = param.split('=')
+                    params[key] = value
+            
+            query = params.get('q', '').replace('+', ' ').strip()
+            
+            if len(query) < 2:
+                self._set_headers()
+                self.wfile.write(json.dumps({'suggestions': []}).encode())
+                return
+            
+            # Use prefix search to find matching words
+            normalized_query = ''.join(c for c in query if c.isalpha()).lower()
+            all_words = set()
+            
+            for doc in engine_state.get_all_documents():
+                words = doc['content'].lower().split()
+                for word in words:
+                    normalized = ''.join(c for c in word if c.isalpha())
+                    if normalized.startswith(normalized_query) and len(normalized) >= 2:
+                        all_words.add(normalized)
+            
+            suggestions = sorted(list(all_words))[:10]  # Top 10
+            
+            self._set_headers()
+            self.wfile.write(json.dumps({'suggestions': suggestions}).encode())
             
         except Exception as e:
             self._set_headers(500)
@@ -348,6 +425,90 @@ class BridgeHandler(BaseHTTPRequestHandler):
             'total_matches': len(results)
         }
     
+    
+    def _handle_rag_request(self):
+        """Handle RAG search request - simplified to direct Ollama query"""
+        try:
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            
+            query = data.get('query', '')
+            if not query:
+                raise ValueError("Query is required")
+            
+            # Just send the query directly to Ollama
+            answer = self._call_ollama(query)
+            
+            self._set_headers()
+            self.wfile.write(json.dumps({'answer': answer}).encode())
+            
+        except Exception as e:
+            self._set_headers(500)
+            self.wfile.write(json.dumps({'error': str(e)}).encode())
+    
+    def _handle_upload(self):
+        """Handle file upload for text extraction and summarization"""
+        try:
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            
+            content = data.get('content', '')
+            filename = data.get('filename', 'document.txt')
+            action = data.get('action', 'summarize')  # 'summarize' or 'extract'
+            
+            if not content:
+                raise ValueError("File content is required")
+            
+            if action == 'extract':
+                # Just return the text content
+                self._set_headers()
+                self.wfile.write(json.dumps({
+                    'result': content,
+                    'filename': filename,
+                    'wordCount': len(content.split())
+                }).encode())
+            else:
+                # Summarize using Ollama
+                prompt = f"Summarize the following text in 2-3 sentences:\n\n{content}"
+                summary = self._call_ollama(prompt)
+                
+                self._set_headers()
+                self.wfile.write(json.dumps({
+                    'result': summary,
+                    'filename': filename,
+                    'originalWordCount': len(content.split())
+                }).encode())
+                
+        except Exception as e:
+            self._set_headers(500)
+            self.wfile.write(json.dumps({'error': str(e)}).encode())
+
+    def _call_ollama(self, prompt):
+        """Call local Ollama API"""
+        try:
+            payload = {
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False
+            }
+            
+            req = urllib.request.Request(
+                OLLAMA_API_URL, 
+                data=json.dumps(payload).encode('utf-8'),
+                headers={'Content-Type': 'application/json'}
+            )
+            
+            with urllib.request.urlopen(req) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                return result.get('response', 'No response from Ollama')
+                
+        except urllib.error.URLError as e:
+            return f"Error connecting to Ollama: {e}. Is Ollama running?"
+        except Exception as e:
+            return f"Error generating answer: {str(e)}"
+
     def log_message(self, format, *args):
         """Custom log format"""
         print(f"[{self.log_date_time_string()}] {format % args}")
@@ -355,9 +516,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
 def main():
     """Start the bridge server"""
     print("=" * 60)
-    print("  Search Engine Bridge Server")
+    print("  Mini Google - RAG Search Engine")
     print("=" * 60)
     print(f"\n🚀 Server starting on http://localhost:{PORT}")
+    
+    # Load documents from folder
+    load_documents_from_folder()
+    
     print(f"\n📝 Instructions:")
     print(f"   1. Make sure 'search_engine.c' is compiled:")
     print(f"      gcc search_engine.c -o search_engine")
