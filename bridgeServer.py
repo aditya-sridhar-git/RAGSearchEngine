@@ -141,6 +141,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         elif self.path == '/api/upload':
             # Handle file upload for summarization
             self._handle_upload()
+        elif self.path == '/api/analyze':
+            # Analyze document using C search engine
+            self._handle_analyze()
         else:
             self._set_headers(404)
             self.wfile.write(b'{"error": "Not found"}')
@@ -481,6 +484,56 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     'originalWordCount': len(content.split())
                 }).encode())
                 
+        except Exception as e:
+            self._set_headers(500)
+            self.wfile.write(json.dumps({'error': str(e)}).encode())
+
+    def _handle_analyze(self):
+        """Analyze document using C search engine (trie, hash table, linked list)"""
+        try:
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            
+            content = data.get('content', '')
+            action = data.get('action', 'freq')  # 'freq', 'search', or 'prefix'
+            query = data.get('query', '')
+            
+            if not content:
+                raise ValueError("Document content is required")
+            if not query:
+                raise ValueError("Query word is required")
+            
+            # Path to compiled C executable
+            cli_path = os.path.join(os.path.dirname(__file__), 'searchCLI.exe')
+            
+            if not os.path.exists(cli_path):
+                raise ValueError("C search engine not compiled. Run: gcc searchCLI.c -o searchCLI.exe")
+            
+            # Call C executable with action and query, pass content via stdin
+            result = subprocess.run(
+                [cli_path, action, query],
+                input=content,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if result.returncode != 0:
+                raise ValueError(f"C engine error: {result.stderr}")
+            
+            # Parse JSON output from C
+            c_result = json.loads(result.stdout)
+            
+            self._set_headers()
+            self.wfile.write(json.dumps(c_result).encode())
+            
+        except json.JSONDecodeError as e:
+            self._set_headers(500)
+            self.wfile.write(json.dumps({'error': f'Invalid C output: {str(e)}'}).encode())
+        except subprocess.TimeoutExpired:
+            self._set_headers(500)
+            self.wfile.write(json.dumps({'error': 'Analysis timed out'}).encode())
         except Exception as e:
             self._set_headers(500)
             self.wfile.write(json.dumps({'error': str(e)}).encode())
